@@ -1,7 +1,6 @@
 /*
  * @Kernel_Hack - ACE Anti-Cheat Coordinate Decryption (ARM64 Android)
  * Copyright (C) 2026 @Kernel_Hack  https://github.com/libtersafe
- * 辅助开发 / Assistant: @xmhnb
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 as published
@@ -38,7 +37,7 @@ static inline ssize_t _pvm_readv(pid_t pid,
     return syscall(__NR_process_vm_readv, pid, lvec, liovcnt, rvec, riovcnt, flags);
 }
 
-#define LOG_TAG "@xmhnb"
+#define LOG_TAG "KernelHack"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)

@@ -1,7 +1,6 @@
 /*
  * @Kernel_Hack - ACE Anti-Cheat Coordinate Decryption (ARM64 Android)
  * Copyright (C) 2026 @Kernel_Hack  https://github.com/libtersafe
- * 辅助开发 / Assistant: @xmhnb
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 as published
