@@ -108,6 +108,9 @@ void SetMemoryReadFunc(ReadMemoryFunc func);
 // 清空页面缓存 (每帧之间调用) / Invalidate page cache
 void InvalidatePageCache();
 
+// 只失效指定地址范围的页面，代码页保持常驻
+void InvalidateDataPages(uint64_t addr, size_t size);
+
 // 从加密的 RootComponent 解密坐标 / Decrypt position from encrypted RootComponent
 Vector3 DecryptPosition(uintptr_t rootComponent, bool isItem = false);
 

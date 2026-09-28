@@ -131,13 +131,29 @@ static bool ReadPageCached(uint64_t pageAddr, void* outBuf)
 // 这很重要: 否则不同 RootComponent 的数据会互相污染
 void InvalidatePageCache()
 {
-    // 卸载所有缓存过的页面 (不卸载栈、返回桩、TLS等固定区域)
     if (g.uc) {
         for (auto& [addr, _] : g.cache) {
             uc_mem_unmap(g.uc, addr, EMU_PAGE_SIZE);
         }
     }
     g.cache.clear();
+}
+
+// 只失效指定地址范围覆盖的页面，其余（代码页等）保持常驻
+void InvalidateDataPages(uint64_t addr, size_t size)
+{
+    if (!g.uc || size == 0) return;
+
+    uint64_t pageStart = addr & ~(EMU_PAGE_SIZE - 1);
+    uint64_t pageEnd   = (addr + size + EMU_PAGE_SIZE - 1) & ~(EMU_PAGE_SIZE - 1);
+
+    for (uint64_t p = pageStart; p < pageEnd; p += EMU_PAGE_SIZE) {
+        auto it = g.cache.find(p);
+        if (it != g.cache.end()) {
+            uc_mem_unmap(g.uc, p, EMU_PAGE_SIZE);
+            g.cache.erase(it);
+        }
+    }
 }
 
 // ================================================================

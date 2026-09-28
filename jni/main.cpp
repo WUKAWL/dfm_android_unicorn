@@ -461,7 +461,7 @@ int main(int argc, char** argv)
             uint64_t rc = pmem.read<uint64_t>(e.actor + 0x3E0);
             if (rc == 0 || rc < 0x1000000000ULL) rc = e.rc;
 
-            InvalidatePageCache();
+            InvalidateDataPages(rc, 0x400);
             CallARM64(decryptAddr, 1, (uint64_t)rc);
 
             float dx=0,dy=0,dz=0;
