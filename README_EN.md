@@ -3,7 +3,6 @@
 **[中文](README.md)** | **English**
 
 **Author**: [@Kernel_Hack](https://github.com/libtersafe)
-**Assistant**: @xmhnb
 **License**: GPL v2 (same as Unicorn Engine)
 
 ---
@@ -11,8 +10,6 @@
 ## Introduction
 
 Decrypts player coordinates encrypted by ACE (Anti-Cheat Expert) shellcode using Unicorn Engine emulation. Pure userspace implementation via Linux syscalls, no kernel module required.
-
-You only need to replace the offset address in the code with the correct address to get the actual decrypted coordinates. Of course, I will not provide this part of the code.
 
 ## Project Structure
 
@@ -104,16 +101,18 @@ struct FEncHandler {         // size = 0x04
 
 ```
 1. Read shellcode (~940KB RWX region) from target process
-2. Map shellcode into Unicorn address space
+2. Pre-map entire shellcode into Unicorn + resolve ELF symbols
+   (hash_direct_start / hash_end for function boundaries)
 3. Map libc.so and install 33 function stubs
    (pthread_*, fopen, ioctl, sysconf, etc.)
 4. Read FEncHandler to check if encrypted
 5. Set ARM64 registers:
    X0 = component pointer
    X1 = encrypted data area address
-   LR = RET_STUB (BRK #0, stops emulation)
-6. uc_emu_start(shellcode + 0x9E000)
-   Execute shellcode decrypt function
+   LR = hash_end (stops when reached)
+6. uc_emu_start(begin=hash_direct_start, until=hash_end,
+   timeout=500ms, count=0)
+   Precise range execution with timeout fallback
    (lazy page mapping handles all memory access)
 7. Read decrypted Vector3 from component + 0x168
 ```
@@ -178,6 +177,5 @@ This project is for security research and educational purposes only. The author 
 ## Credits
 
 - **[@Kernel_Hack](https://github.com/libtersafe)** — Author
-- **@xmhnb** — Assistant
 - **Unicorn Engine** (GPLv2) — CPU emulation framework
 - **Capstone** — Disassembly engine (for analysis)

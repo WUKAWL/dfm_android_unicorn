@@ -3,7 +3,6 @@
 **中文** | **[English](README_EN.md)**
 
 **作者 / Author**: [@Kernel_Hack](https://github.com/libtersafe)
-**辅助开发 / Assistant**: @xmhnb
 **协议 / License**: GPL v2 (与 Unicorn Engine 一致 / same as Unicorn Engine)
 
 ---
@@ -12,8 +11,6 @@
 
 通过 Unicorn Engine 模拟执行 ACE (安全组件) shellcode，解密游戏中被加密的玩家坐标。
 纯用户态实现，所有底层操作通过 Linux syscall 完成，无需内核模块。
-
-你只需要给代码里面的偏移地址更换成正确的地址即可获取到真实的解密后的坐标内容，当然这部分代码我是不会提供的。
 
 Decrypts player coordinates encrypted by ACE (Anti-Cheat Expert) shellcode
 using Unicorn Engine emulation. Pure userspace implementation via Linux syscalls,
@@ -126,8 +123,9 @@ struct FEncHandler {         // size = 0x04
 │  1. 从目标进程读取 shellcode (~940KB RWX 区域)      │
 │     Read shellcode from target process memory      │
 │                                                    │
-│  2. 映射 shellcode 到 Unicorn 虚拟内存               │
-│     Map shellcode into Unicorn address space        │
+│  2. 整块映射 shellcode 到 Unicorn + 解析 ELF 符号     │
+│     Pre-map shellcode + resolve ELF symbols         │
+│     (hash_direct_start / hash_end 等函数边界)        │
 │                                                    │
 │  3. 映射 libc.so 并安装 33 个函数 stub               │
 │     Map libc.so and install 33 function stubs       │
@@ -139,10 +137,11 @@ struct FEncHandler {         // size = 0x04
 │  5. 设置 ARM64 寄存器:                               │
 │     X0 = component 指针                              │
 │     X1 = 加密数据区地址                               │
-│     LR = RET_STUB (BRK #0, 停止模拟)                 │
+│     LR = hash_end (到达即停止)                        │
 │                                                    │
-│  6. uc_emu_start(shellcode + 0x9E000)               │
-│     执行 shellcode 解密函数                           │
+│  6. uc_emu_start(hash_direct_start, hash_end,       │
+│                  timeout=500ms, count=0)             │
+│     begin/until 精确范围 + timeout 兜底               │
 │     (延迟页面映射处理所有内存访问)                      │
 │                                                    │
 │  7. 从 component + 0x168 读取解密后的坐标              │
@@ -213,6 +212,5 @@ This project is licensed under the **GNU General Public License v2 (GPLv2)**, co
 ## 致谢 / Credits
 
 - **[@Kernel_Hack](https://github.com/libtersafe)** — 作者 / Author
-- **@xmhnb** — 辅助开发 / Assistant
 - **Unicorn Engine** (GPLv2) — CPU 模拟框架 / CPU emulation framework
 - **Capstone** — 反汇编引擎 / Disassembly engine (用于分析 / for analysis)

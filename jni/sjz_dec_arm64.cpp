@@ -14,6 +14,8 @@
 
 #include <unicorn/unicorn.h>
 
+#include <elf.h>
+
 #include <unordered_map>
 #include <vector>
 #include <cstring>
@@ -29,7 +31,7 @@ static constexpr uint64_t STACK_BASE      = 0x7000000000ULL;
 static constexpr uint64_t RET_STUB_ADDR   = 0x7100000000ULL;
 static constexpr uint64_t CIPHER_ADDR     = 0x7200000000ULL;
 static constexpr uint64_t TLS_EMU_ADDR    = 0x7300000000ULL;
-static constexpr size_t   MAX_INSN        = 500000;
+static constexpr uint64_t EMU_TIMEOUT     = 500000;        // 500ms (like PoP)
 static constexpr size_t   PAGE_CACHE_MAX  = 256;
 
 // ================================================================
@@ -38,6 +40,22 @@ static constexpr size_t   PAGE_CACHE_MAX  = 256;
 struct CachePage {
     uint8_t  data[EMU_PAGE_SIZE];
     uint64_t tick;
+};
+
+// ================================================================
+//  Shellcode ELF 符号解析结果 (like PoP)
+//  从 shellcode 的 ELF 符号表动态解析函数边界
+// ================================================================
+struct ShellcodeSyms {
+    uint64_t entry              = 0;   // "entry"
+    uint64_t hashEnd            = 0;   // "hash_end"           → until 地址
+    uint64_t hashDirectStart    = 0;   // "hash_direct_start"  → begin 地址
+    uint64_t hashDirectInitStart= 0;   // "hash_direct_init_start"
+    uint64_t hashDirectInitEnd  = 0;   // "hash_direct_init_end"
+    uint64_t ringCalcStart      = 0;   // "ring_calc_start"
+    uint64_t allParamsExecEnd   = 0;   // "all_params_exec_end"
+    uint64_t v87End             = 0;   // "v87_end"
+    bool     resolved           = false;
 };
 
 // ================================================================
@@ -68,12 +86,18 @@ struct EmuCtx {
     // Shellcode mapping
     bool     shellcodeMapped = false;
 
+    // Shellcode 符号解析结果
+    ShellcodeSyms    syms;
+
     // Trace 模式 / Trace mode
     bool     traceEnabled = false;
     int      traceCount   = 0;
 };
 
 static EmuCtx g;
+
+static bool MapShellcode();
+static bool ResolveShellcodeSymbols();
 
 // ================================================================
 //  内存读取封装 / Memory read wrappers
@@ -131,23 +155,38 @@ static bool ReadPageCached(uint64_t pageAddr, void* outBuf)
 // 这很重要: 否则不同 RootComponent 的数据会互相污染
 void InvalidatePageCache()
 {
-    if (g.uc) {
-        for (auto& [addr, _] : g.cache) {
-            uc_mem_unmap(g.uc, addr, EMU_PAGE_SIZE);
+    if (!g.uc) { g.cache.clear(); return; }
+
+    // shellcode 预映射页面不在 cache 里，但仍需安全跳过
+    uint64_t scBase = g.off.shellcodeBase & ~(EMU_PAGE_SIZE - 1);
+    uint64_t scEnd  = (g.off.shellcodeBase + g.off.shellcodeSize +
+                       EMU_PAGE_SIZE - 1) & ~(EMU_PAGE_SIZE - 1);
+
+    for (auto it = g.cache.begin(); it != g.cache.end(); ) {
+        uint64_t addr = it->first;
+        if (g.shellcodeMapped && addr >= scBase && addr < scEnd) {
+            ++it;
+            continue;
         }
+        uc_mem_unmap(g.uc, addr, EMU_PAGE_SIZE);
+        it = g.cache.erase(it);
     }
-    g.cache.clear();
 }
 
-// 只失效指定地址范围覆盖的页面，其余（代码页等）保持常驻
+// 只失效指定地址范围覆盖的数据页，shellcode 页保持常驻
 void InvalidateDataPages(uint64_t addr, size_t size)
 {
     if (!g.uc || size == 0) return;
+
+    uint64_t scBase = g.off.shellcodeBase & ~(EMU_PAGE_SIZE - 1);
+    uint64_t scEnd  = (g.off.shellcodeBase + g.off.shellcodeSize +
+                       EMU_PAGE_SIZE - 1) & ~(EMU_PAGE_SIZE - 1);
 
     uint64_t pageStart = addr & ~(EMU_PAGE_SIZE - 1);
     uint64_t pageEnd   = (addr + size + EMU_PAGE_SIZE - 1) & ~(EMU_PAGE_SIZE - 1);
 
     for (uint64_t p = pageStart; p < pageEnd; p += EMU_PAGE_SIZE) {
+        if (g.shellcodeMapped && p >= scBase && p < scEnd) continue;
         auto it = g.cache.find(p);
         if (it != g.cache.end()) {
             uc_mem_unmap(g.uc, p, EMU_PAGE_SIZE);
@@ -314,9 +353,14 @@ bool InitEmulatorARM64(int pid, const GameOffsets& offsets)
         return false;
     }
 
-    // 启用 NEON/FP (CPACR_EL1.FPEN = 0b11) / Enable NEON / FP
+    // CPU model → Unicorn 自动启用 NEON/FP (like PoP: uc_ctl(uc, 0x44000007, 3))
+#if defined(UC_CTL_CPU_MODEL)
+    uc_ctl_set_cpu_model(g.uc, UC_CPU_ARM64_MAX);
+#else
+    // fallback: 手动启用 NEON/FP (CPACR_EL1.FPEN = 0b11)
     uint64_t cpacr = 3ULL << 20;
     uc_reg_write(g.uc, UC_ARM64_REG_CPACR_EL1, &cpacr);
+#endif
 
     // 栈 / Stack
     uc_mem_map(g.uc, STACK_BASE, STACK_SIZE,
@@ -378,6 +422,15 @@ bool InitEmulatorARM64(int pid, const GameOffsets& offsets)
     }
 
     g.inited = true;
+
+    // pre-map shellcode + resolve ELF symbols (like PoP: init 时一次性完成)
+    MapShellcode();
+    if (ResolveShellcodeSymbols()) {
+        LOGI("shellcode symbols resolved: direct=0x%lx end=0x%lx",
+             (unsigned long)g.syms.hashDirectStart,
+             (unsigned long)g.syms.hashEnd);
+    }
+
     LOGI("ARM64 emulator OK  pid=%d  base=0x%lx",
          pid, (unsigned long)offsets.moduleBase);
     return true;
@@ -459,10 +512,8 @@ static uint64_t EmulateCall(uint64_t funcAddr,
     uint64_t lr = RET_STUB_ADDR;
     uc_reg_write(g.uc, UC_ARM64_REG_LR, &lr);
 
-    // 运行模拟 (当 PC == RET_STUB_ADDR 或达到最大指令数时停止)
-    // Run emulation (stops when PC == RET_STUB_ADDR or max insns)
     uc_err err = uc_emu_start(g.uc, funcAddr, RET_STUB_ADDR,
-                              0, MAX_INSN);
+                              EMU_TIMEOUT, 0);
     if (err != UC_ERR_OK && err != UC_ERR_FETCH_UNMAPPED) {
         LOGE("emu 0x%lx: %s", (unsigned long)funcAddr, uc_strerror(err));
     }
@@ -500,7 +551,7 @@ uint64_t CallARM64(uint64_t funcAddr, int argc, ...)
     uint64_t lr = RET_STUB_ADDR;
     uc_reg_write(g.uc, UC_ARM64_REG_LR, &lr);
 
-    uc_err err = uc_emu_start(g.uc, funcAddr, RET_STUB_ADDR, 0, 0);
+    uc_err err = uc_emu_start(g.uc, funcAddr, RET_STUB_ADDR, EMU_TIMEOUT, 0);
     if (err != UC_ERR_OK && err != UC_ERR_FETCH_UNMAPPED)
         LOGE("CallARM64(0x%lx): %s",
              (unsigned long)funcAddr, uc_strerror(err));
@@ -547,12 +598,154 @@ static bool MapShellcode()
 }
 
 // ================================================================
+//  Shellcode ELF 符号解析 (like PoP)
+//  从 shellcode RWX 区域的 ELF 符号表解析函数边界
+//  支持 section header (.symtab) 和 program header (.dynsym) 两种路径
+// ================================================================
+static bool ResolveShellcodeSymbols()
+{
+    if (g.syms.resolved) return true;
+    uintptr_t base = g.off.shellcodeBase;
+    size_t    total = g.off.shellcodeSize;
+    if (base == 0 || total == 0) return false;
+
+    Elf64_Ehdr ehdr;
+    if (!RdMem(base, &ehdr, sizeof(ehdr))) return false;
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) return false;
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) return false;
+
+    // 需要解析的符号名 → 目标指针
+    struct SymLookup { const char* name; uint64_t* dst; };
+    SymLookup lookups[] = {
+        {"entry",                   &g.syms.entry},
+        {"hash_end",                &g.syms.hashEnd},
+        {"hash_direct_start",       &g.syms.hashDirectStart},
+        {"hash_direct_init_start",  &g.syms.hashDirectInitStart},
+        {"hash_direct_init_end",    &g.syms.hashDirectInitEnd},
+        {"ring_calc_start",         &g.syms.ringCalcStart},
+        {"all_params_exec_end",     &g.syms.allParamsExecEnd},
+        {"v87_end",                 &g.syms.v87End},
+    };
+    constexpr int NUM_LOOKUPS = sizeof(lookups) / sizeof(lookups[0]);
+
+    // 通用解析: 给定 symtab 偏移/大小/entsize 和 strtab 偏移/大小
+    auto resolveFromTable = [&](uint64_t symOff, uint64_t symSz, uint64_t entSz,
+                                uint64_t strOff, uint64_t strSz) -> int {
+        if (entSz < sizeof(Elf64_Sym) || symSz == 0 || strSz == 0) return 0;
+        size_t count = symSz / entSz;
+        if (count > 100000) count = 100000;
+
+        std::vector<uint8_t> symBuf(symSz);
+        std::vector<char>    strBuf(strSz);
+        if (!RdMem(base + symOff, symBuf.data(), symSz)) return 0;
+        if (!RdMem(base + strOff, strBuf.data(), strSz)) return 0;
+
+        int found = 0;
+        for (size_t i = 0; i < count; i++) {
+            auto* sym = (Elf64_Sym*)(symBuf.data() + i * entSz);
+            if (sym->st_name >= strSz || sym->st_value == 0) continue;
+            const char* name = strBuf.data() + sym->st_name;
+            for (int j = 0; j < NUM_LOOKUPS; j++) {
+                if (*lookups[j].dst == 0 && strcmp(name, lookups[j].name) == 0) {
+                    *lookups[j].dst = base + sym->st_value;
+                    found++;
+                    LOGI("  sym %-28s = 0x%lx (sc+0x%lx)",
+                         name, (unsigned long)*lookups[j].dst,
+                         (unsigned long)sym->st_value);
+                    break;
+                }
+            }
+        }
+        return found;
+    };
+
+    int totalFound = 0;
+
+    // --- 路径 1: Section Headers (.symtab + .strtab) ---
+    if (ehdr.e_shoff != 0 && ehdr.e_shnum != 0 &&
+        ehdr.e_shoff + (uint64_t)ehdr.e_shnum * ehdr.e_shentsize <= total)
+    {
+        size_t shdrBufSz = ehdr.e_shnum * ehdr.e_shentsize;
+        std::vector<uint8_t> shdrBuf(shdrBufSz);
+        if (RdMem(base + ehdr.e_shoff, shdrBuf.data(), shdrBufSz)) {
+            for (int i = 0; i < ehdr.e_shnum; i++) {
+                auto* sh = (Elf64_Shdr*)(shdrBuf.data() + i * ehdr.e_shentsize);
+                if (sh->sh_type != SHT_SYMTAB && sh->sh_type != SHT_DYNSYM) continue;
+                if (sh->sh_link >= ehdr.e_shnum) continue;
+                auto* strSh = (Elf64_Shdr*)(shdrBuf.data() + sh->sh_link * ehdr.e_shentsize);
+                totalFound += resolveFromTable(sh->sh_offset, sh->sh_size, sh->sh_entsize,
+                                               strSh->sh_offset, strSh->sh_size);
+            }
+        }
+    }
+
+    // --- 路径 2: Program Headers → PT_DYNAMIC → DT_SYMTAB/DT_STRTAB ---
+    if (totalFound < 2 && ehdr.e_phoff != 0 && ehdr.e_phnum != 0) {
+        size_t phdrBufSz = ehdr.e_phnum * ehdr.e_phentsize;
+        std::vector<uint8_t> phdrBuf(phdrBufSz);
+        if (RdMem(base + ehdr.e_phoff, phdrBuf.data(), phdrBufSz)) {
+            for (int i = 0; i < ehdr.e_phnum; i++) {
+                auto* ph = (Elf64_Phdr*)(phdrBuf.data() + i * ehdr.e_phentsize);
+                if (ph->p_type != PT_DYNAMIC) continue;
+
+                size_t dynCnt = ph->p_filesz / sizeof(Elf64_Dyn);
+                if (dynCnt > 4096) dynCnt = 4096;
+                std::vector<Elf64_Dyn> dyns(dynCnt);
+                if (!RdMem(base + ph->p_offset, dyns.data(), dynCnt * sizeof(Elf64_Dyn)))
+                    break;
+
+                uint64_t dtSymtab = 0, dtStrtab = 0, dtStrsz = 0;
+                uint64_t dtHash = 0, dtSyment = sizeof(Elf64_Sym);
+                for (size_t d = 0; d < dynCnt && dyns[d].d_tag != DT_NULL; d++) {
+                    switch (dyns[d].d_tag) {
+                        case DT_SYMTAB:  dtSymtab = dyns[d].d_un.d_val; break;
+                        case DT_STRTAB:  dtStrtab = dyns[d].d_un.d_val; break;
+                        case DT_STRSZ:   dtStrsz  = dyns[d].d_un.d_val; break;
+                        case DT_HASH:    dtHash   = dyns[d].d_un.d_val; break;
+                        case DT_SYMENT:  dtSyment = dyns[d].d_un.d_val; break;
+                    }
+                }
+                if (dtSymtab && dtStrtab && dtStrsz) {
+                    uint64_t symOff = dtSymtab;
+                    uint64_t strOff = dtStrtab;
+                    // DT_HASH: first word = nbucket, second = nchain = symbol count
+                    uint32_t nchain = 0;
+                    if (dtHash) {
+                        uint32_t hashHdr[2];
+                        if (RdMem(base + dtHash, hashHdr, 8))
+                            nchain = hashHdr[1];
+                    }
+                    if (nchain == 0) nchain = 8192;
+                    uint64_t symSz = nchain * dtSyment;
+                    totalFound += resolveFromTable(symOff, symSz, dtSyment, strOff, dtStrsz);
+                }
+                break;
+            }
+        }
+    }
+
+    g.syms.resolved = (totalFound >= 2 && g.syms.hashDirectStart != 0 && g.syms.hashEnd != 0);
+
+    if (g.syms.resolved) {
+        LOGI("Shellcode symbols resolved: %d found, begin=0x%lx until=0x%lx",
+             totalFound,
+             (unsigned long)g.syms.hashDirectStart,
+             (unsigned long)g.syms.hashEnd);
+    } else if (totalFound > 0) {
+        LOGW("Shellcode symbols partial (%d found), falling back to fixed offsets", totalFound);
+    } else {
+        LOGW("Shellcode has no symbol table, using fixed offsets");
+    }
+    return g.syms.resolved;
+}
+
+// ================================================================
 //  调用 Shellcode 函数
 //  ARM64 AAPCS64: X0, X1, X2, X3 前 4 个参数
 //  LR = RET_STUB_ADDR (函数 RET 跳转到此处 → 模拟停止)
 //  CallShellcodeFunc — call a function in the ACE shellcode
 // ================================================================
-static uint64_t CallShellcodeFunc(uint64_t funcAddr,
+static uint64_t CallShellcodeFunc(uint64_t funcAddr, uint64_t untilAddr,
                                   uint64_t x0, uint64_t x1,
                                   uint64_t x2 = 0, uint64_t x3 = 0)
 {
@@ -565,13 +758,16 @@ static uint64_t CallShellcodeFunc(uint64_t funcAddr,
     uc_reg_write(g.uc, UC_ARM64_REG_X2, &x2);
     uc_reg_write(g.uc, UC_ARM64_REG_X3, &x3);
 
-    uint64_t lr = RET_STUB_ADDR;
+    // LR = untilAddr: 函数 RET 跳转到 until 地址 → uc_emu_start 自动停止
+    uint64_t lr = untilAddr;
     uc_reg_write(g.uc, UC_ARM64_REG_LR, &lr);
 
-    uc_err err = uc_emu_start(g.uc, funcAddr, RET_STUB_ADDR, 0, MAX_INSN);
+    // like PoP: begin/until 精确控制 + timeout 兜底, count=0 不限指令数
+    uc_err err = uc_emu_start(g.uc, funcAddr, untilAddr, EMU_TIMEOUT, 0);
     if (err != UC_ERR_OK && err != UC_ERR_FETCH_UNMAPPED) {
-        LOGE("CallShellcode 0x%lx: %s",
-             (unsigned long)funcAddr, uc_strerror(err));
+        LOGE("CallShellcode 0x%lx→0x%lx: %s",
+             (unsigned long)funcAddr, (unsigned long)untilAddr,
+             uc_strerror(err));
     }
 
     uint64_t ret = 0;
@@ -628,31 +824,26 @@ Vector3 DecryptPosition(uintptr_t rootComponent, bool /*isItem*/)
         return RdVal<Vector3>(encAddr + 0x10);
     }
 
-    // === 调用 shellcode 解密函数 / Call shellcode decrypt function ===
-    // shellcode 期望的参数:
-    //   X0 = 组件指针 (USceneComponent*)
-    //   X1 = 源数据指针 (通常是含加密坐标的栈缓冲区)
-    // 函数从 component+0x210 读取加密数据，原地解密，写回 component+0x168
-    // 通过延迟页面映射操作 Unicorn 中的游戏内存
-    // The shellcode expects:
-    //   X0 = component pointer (USceneComponent*)
-    //   X1 = source data pointer (encrypted coords buffer)
-    // Reads from component+0x210, decrypts in-place, writes to component+0x168
+    // === 调用 shellcode 解密函数 ===
+    // X0 = component pointer, X1 = encrypted coords buffer
+    uint64_t beginAddr, untilAddr;
+    if (g.syms.resolved) {
+        // like PoP: 符号驱动，精确 begin/until
+        beginAddr = g.syms.hashDirectStart;
+        untilAddr = g.syms.hashEnd;
+    } else {
+        // fallback: 偏移 + RET_STUB
+        beginAddr = g.off.shellcodeBase + g.off.scDecryptFuncOff;
+        untilAddr = RET_STUB_ADDR;
+    }
 
-    uint64_t decryptFunc = g.off.shellcodeBase + g.off.scDecryptFuncOff;
+    CallShellcodeFunc(beginAddr, untilAddr, rootComponent, encAddr);
 
-    // X1 参数指向加密坐标缓冲区，我们直接传入加密数据区地址
-    // X1 arg points to encrypted coords buffer, we pass enc data area directly
-    CallShellcodeFunc(decryptFunc, rootComponent, encAddr);
-
-    // 读取解密后的坐标 / Read back the decrypted coordinates
     Vector3 pos = RdVal<Vector3>(rootComponent + GameOffsets::PLAIN_POS_OFF);
 
-    // 验证结果，异常则重试 / Validate and retry if abnormal
     if (IsAbnormalFloatCoord(pos)) {
         for (int retry = 0; retry < 20; retry++) {
-            // 重新读取并解密 / Re-read and re-decrypt
-            CallShellcodeFunc(decryptFunc, rootComponent, encAddr);
+            CallShellcodeFunc(beginAddr, untilAddr, rootComponent, encAddr);
             pos = RdVal<Vector3>(rootComponent + GameOffsets::PLAIN_POS_OFF);
             if (!IsAbnormalFloatCoord(pos)) break;
         }
