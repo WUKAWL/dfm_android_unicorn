@@ -13,10 +13,11 @@
 │  2. 找 libUE4.so 基址      (解析 /proc/pid/maps)            │
 │  3. 找 GameThread TID      (扫描 /proc/pid/task/*/comm)     │
 │  4. 获取 TPIDR_EL0         (ptrace PTRACE_GETREGSET)        │
-│  5. 初始化 Unicorn 模拟器   (ARM64, 栈, 钩子, libc stub)     │
-│  6. 遍历 Actors 找敌方玩家  (GWorld→UWorld→Actors, GName)    │
-│  7. 对每个敌人 call 解密函数 (libUE4+0xD1FBB84 → shellcode)  │
-│  8. 读取 S0/S1/S2 寄存器    (真实解密坐标 X/Y/Z)             │
+│  5. 初始化 Unicorn 模拟器   (uc_ctl CPU model, 栈, 钩子, stub)│
+│  6. 预映射 shellcode + ELF 符号解析 (函数边界定位)            │
+│  7. 遍历 Actors 找敌方玩家  (GWorld→UWorld→Actors, GName)    │
+│  8. 对每个敌人 call 解密     (hash_direct_start→hash_end)    │
+│  9. 从 component+0x168 读取解密坐标 X/Y/Z                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,7 +70,8 @@ SetTpidrEL0(tpidr);
 
 **初始化内容：**
 - Unicorn ARM64 引擎 (`UC_ARCH_ARM64, UC_MODE_ARM`)
-- 启用 NEON/FP (`CPACR_EL1.FPEN = 0b11`)
+- `uc_ctl` 设置 CPU model (`UC_CPU_ARM64_MAX`) → 自动启用 NEON/FP
+  - fallback: `CPACR_EL1.FPEN = 0b11`
 - 256KB 栈 (`0x7000000000`)
 - 返回桩 (`0x7100000000`: NOP + BRK #0)
 - TLS 区域 (`0x7300000000`)
@@ -79,6 +81,11 @@ SetTpidrEL0(tpidr);
   - **Interrupt hook**: BRK 间接跳转处理
   - **Code hook**: MRS TPIDR_EL0 拦截 + trace
 - 33 个 libc 函数 stub (pthread_*, fopen, ioctl, sysconf...)
+- 预映射 shellcode (~940KB 整块写入 Unicorn)
+- 解析 shellcode ELF 符号表 → 定位函数边界:
+  - `hash_direct_start` → 解密函数 begin 地址
+  - `hash_end` → 解密函数 until 地址
+  - `entry`, `ring_calc_start`, `all_params_exec_end` 等
 
 ---
 
@@ -132,11 +139,21 @@ for (int i = 0; i < Actors.count; i++) {
 
 ---
 
-## Step 7: Call 解密函数
+## Step 7-8: Call 解密函数
 
-### 函数地址
+### 函数定位 (ELF 符号解析)
+
+shellcode 本身是 ELF64 格式，包含符号表。初始化时通过双路径解析:
+- **Path 1**: Section Headers → `.symtab` + `.strtab`
+- **Path 2**: Program Headers → `PT_DYNAMIC` → `DT_SYMTAB` / `DT_STRTAB`
+
+解析到的关键符号:
 ```
-libUE4.so + 0xD1FBB84
+hash_direct_start  → 解密函数入口 (begin)
+hash_end           → 解密函数边界 (until)
+entry              → shellcode 总入口
+ring_calc_start    → 环计算入口
+all_params_exec_end → 全参数执行终点
 ```
 
 ### 原始代码 (hook前)
@@ -154,69 +171,80 @@ libUE4.so + 0xD1FBB84
 0xD1FBB8C: .quad 0xb400007a0d5a14c8        ; literal pool
 ```
 
-### 调用方式
+### 调用方式 (PoP 风格)
 ```cpp
-// X0 = RootComponent 指针
-// LR = RET_STUB_ADDR (返回时停止模拟)
-uint64_t ret = CallARM64(libUE4 + 0xD1FBB84, 1, rootComp);
+// 符号驱动: 直接调用 shellcode 内部函数, 精确 begin/until
+uint64_t beginAddr = syms.hashDirectStart;   // ELF 符号解析得到
+uint64_t untilAddr = syms.hashEnd;           // ELF 符号解析得到
 
-// 读取解密后的坐标 (S0/S1/S2 = X/Y/Z)
-float x, y, z;
-uc_reg_read(uc, UC_ARM64_REG_S0, &x);  // 真实 X
-uc_reg_read(uc, UC_ARM64_REG_S1, &y);  // 真实 Y
-uc_reg_read(uc, UC_ARM64_REG_S2, &z);  // 真实 Z
+// X0 = RootComponent, X1 = 加密数据区
+// LR = hash_end (函数 RET 跳到 until → uc_emu_start 自动停止)
+CallShellcodeFunc(beginAddr, untilAddr, rootComp, encAddr);
+
+// 解密结果由 shellcode 直接写回 component 内存
+// 从 component+0x168 读取解密后的坐标
+Vector3 pos = RdVal<Vector3>(rootComp + 0x168);
+```
+
+**Fallback** (符号解析失败时):
+```cpp
+beginAddr = shellcodeBase + scDecryptFuncOff;  // 硬编码偏移
+untilAddr = RET_STUB_ADDR;                     // 返回桩
 ```
 
 ### 执行流程
 ```
-CallARM64(libUE4+0xD1FBB84, rootComp)
+DecryptPosition(rootComp)
   │
-  ├─ ResetForCall()           // 清零 X0-X28, 设置 SP, 清栈
-  ├─ X0 = rootComp            // 设置参数
-  ├─ LR = RET_STUB_ADDR       // 设置返回地址
+  ├─ 读取 FEncHandler → 判断是否加密
+  ├─ 未加密 → 直接返回 component+0x168 明文坐标
   │
-  ├─ uc_emu_start(PC=0xD1FBB84)
+  ├─ 已加密:
+  │   ├─ beginAddr = hash_direct_start  (ELF 符号)
+  │   ├─ untilAddr = hash_end           (ELF 符号)
   │   │
-  │   ├─ [PAGE FETCH] libUE4 页面   // 延迟映射 libUE4 代码页
-  │   ├─ LDR X16, [PC+8]           // 加载 shellcode 地址
-  │   ├─ BR X16                     // 跳转到 shellcode
+  │   ├─ CallShellcodeFunc(begin, until, rootComp, encAddr)
+  │   │   ├─ ResetForCall()             // 清零寄存器, 设置 SP
+  │   │   ├─ X0 = rootComp              // 组件指针
+  │   │   ├─ X1 = encAddr               // 加密数据区
+  │   │   ├─ LR = hash_end              // 到达即停止
+  │   │   │
+  │   │   ├─ uc_emu_start(begin=hash_direct_start,
+  │   │   │               until=hash_end,
+  │   │   │               timeout=500ms, count=0)
+  │   │   │   │
+  │   │   │   ├─ shellcode 已预映射 (init 时整块加载)
+  │   │   │   ├─ [PAGE READ] 游戏对象数据页  // 延迟映射
+  │   │   │   ├─ OLLVM CFF 调度器循环
+  │   │   │   ├─ BRK → OnInterrupt 间接跳转解析
+  │   │   │   ├─ 解密 → 写回 component+0x168
+  │   │   │   └─ PC 到达 hash_end → 自动停止
+  │   │   │
+  │   │   └─ 返回
   │   │
-  │   ├─ [PAGE FETCH] shellcode 页面 // MTE tag 0xB4 → 去掉高字节
-  │   │   // StripMteTag: 0xb400007a0d5a1000 → 0x7a0d5a1000
-  │   │   // 从游戏进程读取真实 shellcode 代码
-  │   │
-  │   ├─ OLLVM CFF 调度器循环        // ~200条指令
-  │   │   ├─ [PAGE READ] 游戏对象数据页  // 读取 RootComponent 数据
-  │   │   ├─ [PAGE READ] vtable 页       // 读取函数指针表
-  │   │   ├─ [PAGE READ] shellcode 数据页 // 读取加密参数
-  │   │   ├─ BL 子函数                    // 调用内部解密子函数
-  │   │   └─ 判断加密状态 → 解密 or 直接返回
-  │   │
-  │   ├─ 设置 S0=X, S1=Y, S2=Z     // 解密结果写入浮点寄存器
-  │   ├─ RET → PC=RET_STUB_ADDR    // 返回到桩地址
-  │   └─ BRK #0 → uc_emu_stop()    // 模拟停止
-  │
-  └─ uc_reg_read(S0/S1/S2)         // 读取解密坐标
+  │   ├─ pos = read(component + 0x168)  // 读取解密坐标
+  │   ├─ 异常检测 + 重试 (最多 20 次)
+  │   └─ 返回 Vector3{X, Y, Z}
 ```
 
 ---
 
-## Step 8: 结果
+## Step 9: 结果
 
 ### 数据对比
 ```
-                    内存 +0x168      解密 S0/S1/S2       说明
-自己 (未加密):   X=-28103 Z=924    -                    真实坐标
-相机 (ViewInfo): X=-28076 Z=970    -                    与自己接近 ✓
+                    内存 +0x168 (加密前)    解密后 +0x168         说明
+自己 (未加密):   X=-28103 Z=924           -                     真实坐标
+相机 (ViewInfo): X=-28076 Z=970           -                     与自己接近 ✓
 
-敌人 (加密):     X=-26559 Z=-407   X=-86009 Z=231       内存是假坐标
-                                                        S寄存器是真实坐标
+敌人 (加密):     X=-26559 Z=-407          X=-86009 Z=231        内存是假坐标
+                                                                shellcode 解密后写回
 ```
 
 ### 关键发现
-- **内存 +0x168 和 +0x220** 存的是 ACE **加密后的假坐标**
-- **S0/S1/S2 寄存器** 返回的是 **真实解密坐标**
-- `bEncrypted` 标志位 (`+0x174`) 始终为 0 — ACE 不使用这个标志
+- **加密前 +0x168** 存的是 ACE **加密后的假坐标**
+- shellcode 解密后将 **真实坐标写回 component 内存**，从 +0x168 读取即可
+- `bEncrypted` 标志位 (`+0x174`) 标记加密状态
 - 加密坐标特征: Z 值为负数 (如 -407), 而真实 Z 应为正数 (如 231)
 - 自己和队友的坐标不被加密, 只有敌方玩家被加密
 
@@ -244,22 +272,34 @@ uc_mem_map(uc, page, ...);                          // 映射到带 tag 地址
 
 ## 每次 Call 前的页面清理
 
-**关键**: 每次解密不同的 RootComponent 前必须清除 Unicorn 中的旧页面映射,
-否则上一次 call 的组件数据会污染当前 call:
+**关键**: 每次解密不同的 RootComponent 前必须清除 Unicorn 中的旧数据页映射,
+否则上一次 call 的组件数据会污染当前 call。
+
+shellcode 代码页在 init 时预映射，不参与清理:
 
 ```cpp
-void InvalidatePageCache() {
-    for (auto& [addr, _] : cache) {
-        uc_mem_unmap(uc, addr, PAGE_SIZE);  // 卸载 Unicorn 中的旧映射
+// InvalidateDataPages: 只清除指定范围的数据页, 跳过 shellcode 页
+void InvalidateDataPages(uint64_t addr, size_t size) {
+    for (每个覆盖的页面 p) {
+        if (p 在 shellcode 范围内) continue;  // shellcode 页保持常驻
+        uc_mem_unmap(uc, p, PAGE_SIZE);
+        cache.erase(p);
     }
-    cache.clear();
+}
+
+// InvalidatePageCache: 清除所有数据页, 保留 shellcode 页
+void InvalidatePageCache() {
+    for (auto it = cache.begin(); it != cache.end(); ) {
+        if (shellcodeMapped && addr 在 shellcode 范围内) { ++it; continue; }
+        uc_mem_unmap(uc, addr, PAGE_SIZE);
+        it = cache.erase(it);
+    }
 }
 
 // 使用:
 for (每个敌人) {
-    InvalidatePageCache();  // 清除旧数据
-    CallARM64(decryptAddr, 1, rootComp);
-    // 读 S0/S1/S2
+    InvalidatePageCache();       // 清除旧数据页 (shellcode 保留)
+    DecryptPosition(rootComp);   // 符号驱动的解密调用
 }
 ```
 
